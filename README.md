@@ -63,16 +63,10 @@ sudo ./SWISS_ARMY_KNIFE.sh
 - 🧰 Perfect for air-gapped environments or minimal containers  
 - 🧼 Helps harden systems with actionable insights  
 
-## 🛠️ Roadmap
-
-- [ ] Optional output to Markdown or HTML  
-- [ ] Log file export  
-- [ ] Integration with GlobalCVE CLI  
-- [ ] Modular plugin system (e.g., `--network`, `--audit`, `--light`)  
 
 ## 🤝 Contributing
 
-Pull requests welcome! Please follow the [GlobalCVE CONTRIBUTING.md](https://github.com/globalcve/globalcve/blob/main/CONTRIBUTING.md) guidelines.
+Pull requests welcome! 
 
 ---
 
@@ -82,7 +76,7 @@ MIT — free to use, modify, and distribute.
 
 ## 🙌 Credits
 
-Crafted with ❤️ by the [GlobalCVE](https://github.com/globalcve) community.
+Crafted with ❤️ by JEGLY
 
 ---
 
