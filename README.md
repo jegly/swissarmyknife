@@ -14,7 +14,6 @@
 
 A modular, Bash power toolkit for Linux system diagnostics,admins, security auditing, and rapid incident response — built for sysadmins, security engineers, and DevSecOps teams.
 
-> Part of the [GlobalCVE](https://github.com/globalcve) initiative to make open source gui security tooling accessible.
 ---
 
 ## 🚀 Features
