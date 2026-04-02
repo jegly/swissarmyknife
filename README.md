@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/github/last-commit/globalcve/swissarmyknife" />
 </p>
 
-
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jegly/swissarmyknife)
 A modular, Bash power toolkit for Linux system diagnostics,admins, security auditing, and rapid incident response — built for sysadmins, security engineers, and DevSecOps teams.
 
 ---
