@@ -4,13 +4,23 @@
 # COMPREHENSIVE SYSTEM DIAGNOSTIC TOOLKIT - SWISS ARMY KNIFE EDITION
 # ═══════════════════════════════════════════════════════════════════════════
 # Dependencies: whiptail, bash, coreutils, less
-# Version: 3.0 - Complete Edition
+# Version: 4.0 - Complete Edition
 # ═══════════════════════════════════════════════════════════════════════════
+
+set -uo pipefail
+
+VERSION="4.0"
+HISTORY_FILE="$HOME/.diagnostic_history"
+FAVORITES_FILE="$HOME/.diagnostic_favorites"
+CMD_TIMEOUT="${SAK_TIMEOUT:-120}"   # seconds; long-running commands are killed
+LAST_OUTPUT_FILE=""
+TMP_FILES=()
 
 declare -A MENU
 declare -A COMMAND_SAFETY  # Track command safety levels
-HISTORY_FILE="$HOME/.diagnostic_history"
-FAVORITES_FILE="$HOME/.diagnostic_favorites"
+
+cleanup() { (( ${#TMP_FILES[@]} )) && rm -f "${TMP_FILES[@]}" 2>/dev/null; }
+trap cleanup EXIT
 
 # Format: MENU["Category:Command"]="Description"
 
@@ -141,6 +151,8 @@ MENU["Cleanup:journalctl --vacuum-size=100M"]="Limit journal to 100MB"
 MENU["Cleanup:journalctl --vacuum-time=7d"]="Remove journal entries older than 7 days"
 MENU["Cleanup:journalctl --rotate"]="Rotate journal logs"
 MENU["Cleanup:systemd-tmpfiles --clean"]="Clean temporary files"
+MENU["Cleanup:apt autoremove"]="Remove unused packages (modifies system)"
+MENU["Cleanup:apt clean"]="Clear local package cache (modifies system)"
 COMMAND_SAFETY["Cleanup:apt autoremove"]="MODIFIES"
 COMMAND_SAFETY["Cleanup:apt clean"]="MODIFIES"
 
@@ -228,6 +240,7 @@ MENU["Containers:docker info"]="Docker system information"
 MENU["Containers:podman ps -a"]="List Podman containers"
 MENU["Containers:podman images"]="List Podman images"
 MENU["Containers:lxc list"]="List LXC containers"
+MENU["Containers:docker system prune -a"]="⚠️  Remove ALL unused Docker data (DANGEROUS)"
 COMMAND_SAFETY["Containers:docker system prune -a"]="DANGEROUS"
 
 # 💾 DISK I/O & FILESYSTEM
@@ -411,392 +424,347 @@ MENU["Quick Actions:VIEW_FAVORITES"]="⭐ View favorite commands"
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Check if command exists
+# ─── whiptail wrappers (consistent stderr capture & sizing) ──────────────────
+wt_menu()  { whiptail --title "$1" --menu  "$2" "${3:-25}" "${4:-100}" "${5:-15}" "${@:6}" 3>&1 1>&2 2>&3; }
+wt_yesno() { whiptail --title "$1" --yesno "$2" "${3:-14}" "${4:-78}" 3>&1 1>&2 2>&3; }
+wt_input() { whiptail --title "$1" --inputbox "$2" "${3:-10}" "${4:-72}" "${5:-}" 3>&1 1>&2 2>&3; }
+wt_msg()   { whiptail --title "$1" --scrolltext --msgbox "$2" "${3:-22}" "${4:-90}"; }
+
+# First token of a command (ignoring a leading sudo).
+base_cmd() { awk '{print $1}' <<<"${1#sudo }"; }
+
+# Is the command's primary tool installed?
+tool_available() { command -v "$(base_cmd "$1")" &>/dev/null; }
+
 check_command_exists() {
-  local cmd=$1
-  local base_cmd=$(echo "$cmd" | awk '{print $1}')
-  
-  if ! command -v "$base_cmd" &> /dev/null; then
-    whiptail --title "Command Not Found" --msgbox \
-      "Command '$base_cmd' is not installed.\n\nInstall with:\nsudo apt install $base_cmd\n\nOr check if it's available in your distribution's repositories." 12 70
+  local b; b=$(base_cmd "$1")
+  if ! command -v "$b" &>/dev/null; then
+    wt_msg "Command Not Found" \
+      "The tool '$b' is not installed.\n\nTry:\n  sudo apt install $b\n\n(Package name may differ from the command name.)" 14 70
     return 1
   fi
   return 0
 }
 
-# Check if command needs sudo
-needs_sudo() {
-  local cmd=$1
-  if [[ "$cmd" =~ ^(iptables|dmidecode|hwinfo|smartctl|hdparm|fsck|docker|systemctl.*restart|systemctl.*stop|systemctl.*start|apt|dpkg) ]]; then
-    return 0
-  fi
+# Heuristic: does this command likely require root? (FIXES the old dead needs_sudo)
+command_needs_sudo() {
+  local cmd="$1"
+  [[ $EUID -eq 0 ]] && return 1            # already root
+  [[ "$cmd" == sudo\ * ]] && return 1      # already explicit
+  case "$cmd" in
+    iptables*|dmidecode*|hwinfo*|smartctl*|hdparm*|fsck*|tcpdump*|iotop*|\
+    fail2ban-client*|auditctl*|ausearch*|aureport*|debsums*|powertop*|\
+    *dpkg\ --verify*|*"crontab -l"*) return 0 ;;
+  esac
+  # Reads a typically root-only log/path (but plain `ls` of it is fine)
+  [[ "$cmd" == *"/var/log/auth.log"* || "$cmd" == *"/var/log/kern.log"* ]] \
+    && [[ "$cmd" != ls\ * ]] && return 0
   return 1
 }
 
-# Display output with size handling
-display_output() {
-  local cmd="$1"
-  local output="$2"
-  local exit_code="$3"
-  
-  # Count lines in output
-  local line_count=$(echo "$output" | wc -l)
-  local char_count=$(echo "$output" | wc -c)
-  
-  # Whiptail has a limit of ~100KB for arguments
-  if [[ $char_count -gt 50000 ]] || [[ $line_count -gt 1000 ]]; then
-    local temp_file=$(mktemp /tmp/diagnostic_output.XXXXXX)
-    echo "$output" > "$temp_file"
-    
-    if whiptail --title "Large Output Detected" --yesno "Output is very large ($line_count lines, $(($char_count / 1024))KB).\n\nView in 'less' pager for better navigation?\n\nYes = Open in less (recommended)\nNo = Show truncated output in dialog" 15 70 3>&1 1>&2 2>&3; then
-      clear
-      echo "=========================================="
-      echo "Command: $cmd"
-      echo "=========================================="
-      echo ""
-      less "$temp_file"
-      rm -f "$temp_file"
-    else
-      local truncated_output=$(echo "$output" | head -500)
-      local warning_msg="⚠️  OUTPUT TRUNCATED ⚠️\n\nShowing first 500 of $line_count lines\nFull output: $(($char_count / 1024))KB\n\n"
-      warning_msg+="Run command manually to see full output:\n$cmd\n\n"
-      warning_msg+="----------------------------------------\n\n"
-      warning_msg+="$truncated_output"
-      
-      if [[ $exit_code -ne 0 ]]; then
-        whiptail --title "Command Failed (Exit Code: $exit_code)" --scrolltext --msgbox "$warning_msg" 30 100
-      else
-        whiptail --title "Output: $cmd" --scrolltext --msgbox "$warning_msg" 30 100
-      fi
-      rm -f "$temp_file"
-    fi
-  else
-    if [[ $exit_code -ne 0 ]]; then
-      whiptail --title "Command Failed (Exit Code: $exit_code)" --scrolltext --msgbox "Command: $cmd\n\n$output" 30 100
-    else
-      whiptail --title "Output: $cmd" --scrolltext --msgbox "$output" 30 100
-    fi
-  fi
+# Risk classification. Explicit COMMAND_SAFETY wins; otherwise heuristics.
+# Returns: SAFE | MODIFIES | DANGEROUS
+classify_safety() {
+  local key="$1" cmd="$2"
+  if [[ -n "${COMMAND_SAFETY[$key]:-}" ]]; then echo "${COMMAND_SAFETY[$key]}"; return; fi
+  case "$cmd" in
+    *"rm -rf"*|*mkfs*|*"dd if="*|*" prune"*|*"prune -"*|*"iptables -F"*|\
+    *shutdown*|*reboot*|*" kill "*|*pkill*|*mkswap*|*">/dev/sd"*)
+      echo "DANGEROUS"; return ;;
+    apt*install*|apt*remove*|"apt autoremove"|"apt clean"|apt*upgrade*|\
+    *"systemctl start"*|*"systemctl stop"*|*"systemctl restart"*|\
+    *"systemctl enable"*|*"systemctl disable"*|*daemon-reload*|\
+    *--vacuum*|*update-ca-certificates*|*--rotate*|*"tmpfiles --clean"*|\
+    *"nginx -s"*|*"chmod "*|*"chown "*|*"modprobe "*)
+      echo "MODIFIES"; return ;;
+  esac
+  echo "SAFE"
 }
 
-# Log command to history
-log_to_history() {
-  local cmd="$1"
-  echo "$(date '+%Y-%m-%d %H:%M:%S') | $cmd" >> "$HISTORY_FILE"
-}
+log_to_history() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$HISTORY_FILE"; }
 
-# Add to favorites
 add_to_favorites() {
   local key="$1"
-  if ! grep -q "^$key$" "$FAVORITES_FILE" 2>/dev/null; then
+  if ! grep -qxF "$key" "$FAVORITES_FILE" 2>/dev/null; then
     echo "$key" >> "$FAVORITES_FILE"
-    whiptail --title "Added to Favorites" --msgbox "Command added to favorites!\n\nAccess via: Quick Actions → View Favorites" 10 60
+    wt_msg "Added to Favorites" "Saved!\n\nAccess via: Quick Actions → View Favorites" 10 60
   else
-    whiptail --title "Already in Favorites" --msgbox "This command is already in your favorites." 8 50
+    wt_msg "Already a Favorite" "This command is already in your favorites." 8 55
   fi
 }
 
-# Health check function
-run_health_check() {
-  local report=""
-  report+="═══════════════════════════════════════════════════════════\n"
-  report+="SYSTEM HEALTH CHECK REPORT\n"
-  report+="Generated: $(date)\n"
-  report+="═══════════════════════════════════════════════════════════\n\n"
-  
-  # System Info
-  report+="[SYSTEM INFO]\n"
-  report+="Hostname: $(hostname)\n"
-  report+="Kernel: $(uname -r)\n"
-  report+="Uptime: $(uptime -p)\n\n"
-  
-  # Load Average
-  report+="[LOAD AVERAGE]\n"
-  report+="$(uptime | awk -F'load average:' '{print $2}')\n\n"
-  
-  # CPU
-  report+="[CPU]\n"
-  report+="$(lscpu | grep -E '^Model name|^CPU\(s\):|^Thread|^Core')\n\n"
-  
-  # Memory
-  report+="[MEMORY]\n"
-  report+="$(free -h)\n\n"
-  
-  # Disk Space
-  report+="[DISK SPACE]\n"
-  report+="$(df -h | grep -v tmpfs | grep -v loop)\n\n"
-  
-  # Failed Services
-  report+="[FAILED SERVICES]\n"
-  local failed=$(systemctl --failed --no-pager --no-legend)
-  if [[ -z "$failed" ]]; then
-    report+="✓ No failed services\n\n"
+# Save the most recent command output to a user-chosen file.
+save_last_output() {
+  [[ -f "$LAST_OUTPUT_FILE" ]] || { wt_msg "No Output" "Nothing to save yet." 8 50; return; }
+  local default="$HOME/sak_output_$(date +%Y%m%d_%H%M%S).txt" path
+  path=$(wt_input "Save Output" "Write output to file:" 10 72 "$default") || return
+  [[ -z "$path" ]] && return
+  if cp "$LAST_OUTPUT_FILE" "$path" 2>/dev/null; then
+    wt_msg "Saved" "Output written to:\n$path" 9 72
   else
-    report+="$failed\n\n"
-  fi
-  
-  # Recent Errors
-  report+="[RECENT ERRORS - Last 20]\n"
-  report+="$(journalctl -p err -n 20 --no-pager 2>/dev/null || echo 'Unable to read journal')\n\n"
-  
-  # Network
-  report+="[NETWORK]\n"
-  report+="$(ip -br a)\n\n"
-  
-  # Top Processes by CPU
-  report+="[TOP 5 CPU CONSUMERS]\n"
-  report+="$(ps aux --sort=-pcpu | head -6 | tail -5)\n\n"
-  
-  # Top Processes by Memory
-  report+="[TOP 5 MEMORY CONSUMERS]\n"
-  report+="$(ps aux --sort=-%mem | head -6 | tail -5)\n\n"
-  
-  report+="═══════════════════════════════════════════════════════════\n"
-  report+="END OF HEALTH CHECK REPORT\n"
-  report+="═══════════════════════════════════════════════════════════\n"
-  
-  display_output "Health Check" "$report" 0
-  
-  # Offer to save
-  if whiptail --title "Save Report?" --yesno "Would you like to save this health check report to a file?" 8 60 3>&1 1>&2 2>&3; then
-    local filename="health_check_$(date +%Y%m%d_%H%M%S).txt"
-    echo -e "$report" > ~/"$filename"
-    whiptail --title "Report Saved" --msgbox "Health check report saved to:\n\n~/$filename" 10 60
+    wt_msg "Error" "Could not write to:\n$path" 9 60
   fi
 }
 
-# Export full diagnostic report
-export_full_report() {
-  local filename="diagnostic_report_$(date +%Y%m%d_%H%M%S).txt"
-  local report_file=~/"$filename"
-  
-  whiptail --title "Generating Report" --infobox "Generating comprehensive diagnostic report...\n\nThis may take a few minutes." 8 60
-  
+# Render command output: pager for big results, textbox otherwise.
+display_output() {
+  local cmd="$1" output="$2" exit_code="${3:-0}" lines chars tmp title
+  lines=$(wc -l <<<"$output"); chars=$(wc -c <<<"$output")
+  tmp=$(mktemp "${TMPDIR:-/tmp}/sak_out.XXXXXX"); TMP_FILES+=("$tmp")
   {
-    echo "═══════════════════════════════════════════════════════════"
-    echo "COMPREHENSIVE SYSTEM DIAGNOSTIC REPORT"
-    echo "Generated: $(date)"
-    echo "Hostname: $(hostname)"
-    echo "═══════════════════════════════════════════════════════════"
-    echo ""
-    
-    # Run a selection of key commands
-    local key_commands=(
-      "uname -a"
-      "uptime"
-      "free -h"
-      "df -h"
-      "lsblk"
-      "ip a"
-      "systemctl --failed"
-      "journalctl -p err -n 50 --no-pager"
-    )
-    
-    for cmd in "${key_commands[@]}"; do
-      echo ""
-      echo "───────────────────────────────────────────────────────────"
-      echo "Command: $cmd"
-      echo "───────────────────────────────────────────────────────────"
-      eval "$cmd" 2>&1 || echo "Command failed or not available"
-      echo ""
-    done
-    
-    echo "═══════════════════════════════════════════════════════════"
-    echo "END OF REPORT"
-    echo "═══════════════════════════════════════════════════════════"
-  } > "$report_file"
-  
-  whiptail --title "Report Generated" --msgbox "Comprehensive diagnostic report saved to:\n\n$report_file\n\nYou can view it with:\nless $report_file" 12 70
+    echo "Command : $cmd"
+    echo "Exit    : $exit_code    Lines: $lines    Size: $((chars/1024))KB"
+    echo "When    : $(date '+%F %T')"
+    printf '%.0s─' {1..72}; echo
+    echo "$output"
+  } > "$tmp"
+  LAST_OUTPUT_FILE="$tmp"
+
+  title="Output: $cmd"
+  (( exit_code != 0 )) && title="Command Failed (exit $exit_code): $cmd"
+
+  if (( chars > 40000 || lines > 800 )); then
+    if wt_yesno "Large Output" "Output is large ($lines lines, $((chars/1024))KB).\n\nYes = open in pager (less)\nNo  = show truncated in a dialog" 13 70; then
+      clear; less -R "$tmp"
+    else
+      wt_msg "$title (truncated)" "$(head -400 "$tmp")\n\n[... truncated — choose 'Save output' to keep the full result ...]" 30 100
+    fi
+  else
+    whiptail --title "$title" --scrolltext --textbox "$tmp" 30 100
+  fi
 }
 
-# Search commands
+# Menu shown after a command runs (replaces the old forced favorites prompt).
+post_run_menu() {
+  local key="$1" cmd="$2" sel
+  while true; do
+    sel=$(wt_menu "What next?" "Finished: $cmd" 17 80 7 \
+      RERUN "🔁 Run again" \
+      VIEW  "📄 View output in pager" \
+      SAVE  "💾 Save output to file" \
+      FAV   "⭐ Add to favorites" \
+      BACK  "↩ Back to menu") || return
+    case "$sel" in
+      RERUN) execute_command "$key"; return ;;
+      VIEW)  [[ -f "$LAST_OUTPUT_FILE" ]] && { clear; less -R "$LAST_OUTPUT_FILE"; } ;;
+      SAVE)  save_last_output ;;
+      FAV)   add_to_favorites "$key" ;;
+      BACK)  return ;;
+    esac
+  done
+}
+
+# Core: preview → confirm-if-risky → (sudo) → timeout → capture → display.
+execute_command() {
+  local key="$1" cmd safety
+  cmd="${key#*:}"                      # everything after the first colon
+
+  if [[ "$cmd" =~ \<.*\> ]]; then
+    wt_msg "Manual Input Needed" "This command has placeholders:\n\n$cmd\n\nRun it manually and substitute real values." 12 80
+    return
+  fi
+
+  check_command_exists "$cmd" || return
+  safety=$(classify_safety "$key" "$cmd")
+
+  local use_sudo=0; command_needs_sudo "$cmd" && use_sudo=1
+  local sudo_txt="no"; (( use_sudo )) && sudo_txt="yes (sudo)"
+  local preview="Command : $cmd\nCategory: ${key%%:*}\nSafety  : $safety\nPrivilege: $sudo_txt\nTimeout : ${CMD_TIMEOUT}s"
+
+  # Only interrupt the user for state-changing or destructive commands.
+  case "$safety" in
+    DANGEROUS) wt_yesno "⚠️  DANGEROUS COMMAND" "$preview\n\nThis may disrupt the system or destroy data.\n\nProceed?" 17 80 || return ;;
+    MODIFIES)  wt_yesno "⚙️  Modifies System"   "$preview\n\nThis changes system state.\n\nProceed?" 16 80 || return ;;
+  esac
+
+  # Acquire sudo cleanly up-front so the password prompt isn't swallowed.
+  if (( use_sudo )); then
+    clear; echo "🔑 '$cmd' needs root privileges."
+    if ! sudo -v; then wt_msg "Sudo Failed" "Could not obtain root privileges." 8 55; return; fi
+  fi
+
+  clear
+  local runner="bash -c" pfx=""
+  (( use_sudo )) && { runner="sudo bash -c"; pfx="sudo "; }
+  echo "▶ ${pfx}$cmd"
+  local output exit_code
+  output=$(timeout "$CMD_TIMEOUT" $runner "$cmd" 2>&1); exit_code=$?
+  (( exit_code == 124 )) && output+=$'\n\n[!] Timed out after '"${CMD_TIMEOUT}"'s and was terminated.'
+
+  log_to_history "${pfx}$cmd"
+  display_output "$cmd" "$output" "$exit_code"
+  post_run_menu "$key" "$cmd"
+}
+
+# Safe, case-insensitive literal search (no regex injection).
 search_commands() {
-  local keyword=$(whiptail --inputbox "Enter search keyword:" 10 60 3>&1 1>&2 2>&3)
-  [[ -z "$keyword" ]] && return
-  
+  local kw lc key; kw=$(wt_input "Search" "Search all commands (case-insensitive):" 10 72) || return
+  [[ -z "$kw" ]] && return
+  lc=${kw,,}
   local results=()
   for key in "${!MENU[@]}"; do
-    if [[ "$key" =~ $keyword ]] || [[ "${MENU[$key]}" =~ $keyword ]]; then
+    if [[ "${key,,}" == *"$lc"* || "${MENU[$key],,}" == *"$lc"* ]]; then
       results+=("$key" "${MENU[$key]}")
     fi
   done
-  
-  if [[ ${#results[@]} -eq 0 ]]; then
-    whiptail --title "No Results" --msgbox "No commands found matching: $keyword" 8 60
-    return
-  fi
-  
-  local choice=$(whiptail --title "Search Results for: $keyword" --menu "Found ${#results[@]} matches:" 25 100 15 "${results[@]}" 3>&1 1>&2 2>&3)
-  [[ -z "$choice" ]] && return
-  
-  # Execute the selected command
+  (( ${#results[@]} == 0 )) && { wt_msg "No Results" "No commands match: $kw" 8 60; return; }
+  local choice; choice=$(wt_menu "Search: $kw ($(( ${#results[@]} / 2 )) hits)" "Select a command:" 25 100 15 "${results[@]}") || return
   execute_command "$choice"
 }
 
-# View history
 view_history() {
-  if [[ ! -f "$HISTORY_FILE" ]]; then
-    whiptail --title "No History" --msgbox "No command history found yet." 8 50
-    return
-  fi
-  
-  local history_content=$(tail -50 "$HISTORY_FILE")
-  whiptail --title "Command History (Last 50)" --scrolltext --msgbox "$history_content" 25 100
+  [[ -s "$HISTORY_FILE" ]] || { wt_msg "No History" "No command history yet." 8 50; return; }
+  wt_msg "Command History (last 60)" "$(tail -60 "$HISTORY_FILE")" 28 100
 }
 
-# View favorites
 view_favorites() {
-  if [[ ! -f "$FAVORITES_FILE" ]] || [[ ! -s "$FAVORITES_FILE" ]]; then
-    whiptail --title "No Favorites" --msgbox "No favorite commands yet.\n\nAdd favorites by selecting a command and choosing 'Add to Favorites'." 10 60
-    return
-  fi
-  
-  local fav_options=()
+  [[ -s "$FAVORITES_FILE" ]] || { wt_msg "No Favorites" "No favorites yet.\n\nAdd one from the post-run menu (⭐ Add to favorites)." 10 60; return; }
+  local fav=() key
   while IFS= read -r key; do
-    [[ -n "$key" ]] && fav_options+=("$key" "${MENU[$key]}")
+    [[ -n "$key" ]] && fav+=("$key" "${MENU[$key]:-(no longer available)}")
   done < "$FAVORITES_FILE"
-  
-  if [[ ${#fav_options[@]} -eq 0 ]]; then
-    whiptail --title "No Favorites" --msgbox "No favorite commands found." 8 50
-    return
-  fi
-  
-  local choice=$(whiptail --title "Favorite Commands" --menu "Select a favorite command:" 25 100 15 "${fav_options[@]}" 3>&1 1>&2 2>&3)
-  [[ -z "$choice" ]] && return
-  
+  (( ${#fav[@]} == 0 )) && { wt_msg "No Favorites" "No favorite commands found." 8 50; return; }
+  local choice; choice=$(wt_menu "Favorite Commands" "Select a favorite:" 25 100 15 "${fav[@]}") || return
   execute_command "$choice"
 }
 
-# Execute command (extracted for reuse)
-execute_command() {
-  local CHOICE="$1"
-  local CMD=$(echo "$CHOICE" | cut -d: -f2-)
-  
-  # Check if command requires user input (contains placeholders)
-  if [[ "$CMD" =~ \<.*\> ]]; then
-    whiptail --title "Command Requires Input" --msgbox "This command contains placeholders:\n\n$CMD\n\nPlease run it manually in your terminal and replace the placeholders with actual values." 12 80
-    return
-  fi
-  
-  # Check if command exists
-  if ! check_command_exists "$CMD"; then
-    return
-  fi
-  
-  # Check if dangerous
-  if [[ "${COMMAND_SAFETY[$CHOICE]}" == "DANGEROUS" ]]; then
-    if ! whiptail --title "⚠️  DANGEROUS COMMAND WARNING ⚠️" --yesno "This command can cause system disruption:\n\n$CMD\n\nAre you SURE you want to proceed?" 12 70 3>&1 1>&2 2>&3; then
-      return
-    fi
-  fi
-  
-  # Execute command and capture output
-  OUTPUT=$(eval "$CMD" 2>&1)
-  EXIT_CODE=$?
-  
-  # Log to history
-  log_to_history "$CMD"
-  
-  # Display output with size handling
-  display_output "$CMD" "$OUTPUT" "$EXIT_CODE"
-  
-  # Offer to add to favorites
-  if whiptail --title "Add to Favorites?" --yesno "Would you like to add this command to your favorites for quick access?" 8 60 3>&1 1>&2 2>&3; then
-    add_to_favorites "$CHOICE"
+# ─── Reports ──────────────────────────────────────────────────────────────────
+run_health_check() {
+  local report=""
+  report+="═══════════════════════════════════════════════════════════\n"
+  report+="SYSTEM HEALTH CHECK REPORT\nGenerated: $(date)\n"
+  report+="═══════════════════════════════════════════════════════════\n\n"
+  report+="[SYSTEM]\nHostname: $(hostname)\nKernel: $(uname -r)\nUptime: $(uptime -p)\n\n"
+  report+="[LOAD AVERAGE]\n$(uptime | awk -F'load average:' '{print $2}')\n\n"
+  report+="[CPU]\n$(lscpu | grep -E '^Model name|^CPU\(s\):|^Thread|^Core')\n\n"
+  report+="[MEMORY]\n$(free -h)\n\n"
+  report+="[DISK]\n$(df -h | grep -vE 'tmpfs|loop')\n\n"
+  report+="[THERMAL]\n"
+  local t; t=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | awk '{printf "%.0f°C ", $1/1000}')
+  report+="${t:-n/a}\n\n"
+  report+="[FAILED SERVICES]\n"
+  local failed; failed=$(systemctl --failed --no-pager --no-legend 2>/dev/null)
+  report+="${failed:-✓ none}\n\n"
+  report+="[RECENT ERRORS - last 20]\n$(journalctl -p err -n 20 --no-pager 2>/dev/null || echo 'journal unavailable')\n\n"
+  report+="[NETWORK]\n$(ip -br a 2>/dev/null)\n\n"
+  report+="[TOP 5 CPU]\n$(ps aux --sort=-pcpu | head -6 | tail -5)\n\n"
+  report+="[TOP 5 MEM]\n$(ps aux --sort=-%mem | head -6 | tail -5)\n\n"
+  report+="═══════════════════════════════════════════════════════════\n"
+  display_output "Health Check" "$(echo -e "$report")" 0
+  if wt_yesno "Save Report?" "Save this health check to a file?" 8 60; then
+    local f="$HOME/health_check_$(date +%Y%m%d_%H%M%S).txt"
+    echo -e "$report" > "$f"
+    wt_msg "Saved" "Report saved to:\n$f" 9 70
   fi
 }
+
+export_full_report() {
+  local f="$HOME/diagnostic_report_$(date +%Y%m%d_%H%M%S).txt"
+  whiptail --title "Generating Report" --infobox "Collecting diagnostics…\nThis can take a minute." 8 60
+  {
+    echo "════════════════════════════════════════════════════════════"
+    echo "COMPREHENSIVE SYSTEM DIAGNOSTIC REPORT"
+    echo "Generated: $(date)   Host: $(hostname)"
+    echo "════════════════════════════════════════════════════════════"
+    local c; for c in "uname -a" "uptime" "free -h" "df -h" "lsblk" "ip a" \
+                      "systemctl --failed" "journalctl -p err -n 50 --no-pager"; do
+      echo; echo "────────────────────────────────────────────────────────"
+      echo "Command: $c"
+      echo "────────────────────────────────────────────────────────"
+      eval "$c" 2>&1 || echo "(failed or unavailable)"
+    done
+    echo; echo "END OF REPORT"
+  } > "$f"
+  wt_msg "Report Generated" "Saved to:\n$f\n\nView with:\n  less $f" 12 72
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STARTUP
+# ═══════════════════════════════════════════════════════════════════════════
+case "${1:-}" in
+  --version|-v) echo "Swiss Army Knife Diagnostic Toolkit v$VERSION"; exit 0 ;;
+  --help|-h)
+    echo "Usage: $0 [--health|--report|--version|--help]"
+    echo "  (no args)   launch the interactive menu"
+    echo "  --health    run the health check"
+    echo "  --report    export a full diagnostic report"
+    echo "Env: SAK_TIMEOUT=<seconds> per-command timeout (default 120)"
+    exit 0 ;;
+esac
+
+command -v whiptail &>/dev/null || { echo "ERROR: 'whiptail' is required. Install: sudo apt install whiptail"; exit 1; }
+touch "$HISTORY_FILE" "$FAVORITES_FILE" 2>/dev/null || true
+
+case "${1:-}" in
+  --health) run_health_check; exit 0 ;;
+  --report) export_full_report; exit 0 ;;
+esac
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════════════════════
-
 while true; do
-  # Build category list
+  # Build sorted unique category list
   CATEGORIES=()
   for key in "${!MENU[@]}"; do
-    CATEGORY="${key%%:*}"
-    if [[ ! " ${CATEGORIES[*]} " =~ " ${CATEGORY} " ]]; then
-      CATEGORIES+=("$CATEGORY")
-    fi
+    cat="${key%%:*}"
+    [[ " ${CATEGORIES[*]} " == *" $cat "* ]] || CATEGORIES+=("$cat")
   done
+  IFS=$'\n' CATEGORIES=($(sort <<<"${CATEGORIES[*]}")); unset IFS
 
-  # Sort categories alphabetically
-  IFS=$'\n' CATEGORIES=($(sort <<<"${CATEGORIES[*]}"))
-  unset IFS
+  CATEGORY_OPTIONS=("🔍 SEARCH" "Search all commands by keyword")
+  for c in "${CATEGORIES[@]}"; do CATEGORY_OPTIONS+=("$c" "$c"); done
 
-  # Build whiptail menu with label-description pairs
-  CATEGORY_OPTIONS=()
-  for c in "${CATEGORIES[@]}"; do
-    CATEGORY_OPTIONS+=("$c" "$c")
-  done
+  CATEGORY=$(wt_menu "🧰 Swiss Army Knife Diagnostic Toolkit v$VERSION" \
+    "Select a category (or search):" 26 74 16 "${CATEGORY_OPTIONS[@]}") || exit 0
 
-  CATEGORY=$(whiptail --title "🧰 System Diagnostic Toolkit - Swiss Army Knife Edition v3.0" --menu "Select a category:" 25 70 15 "${CATEGORY_OPTIONS[@]}" 3>&1 1>&2 2>&3)
-  [[ $? -ne 0 ]] && exit 0
+  if [[ "$CATEGORY" == "🔍 SEARCH" ]]; then search_commands; continue; fi
 
-  # Handle special actions
   if [[ "$CATEGORY" == "Quick Actions" ]]; then
-    # Build Quick Actions submenu
-    QA_COMMANDS=()
-    for key in "${!MENU[@]}"; do
-      [[ "$key" == "Quick Actions:"* ]] && QA_COMMANDS+=("$key" "${MENU[$key]}")
-    done
-    
-    QA_CHOICE=$(whiptail --title "Quick Actions" --menu "Select an action:" 20 70 10 "${QA_COMMANDS[@]}" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && continue
-    
+    QA=()
+    for key in "${!MENU[@]}"; do [[ "$key" == "Quick Actions:"* ]] && QA+=("$key" "${MENU[$key]}"); done
+    QA_CHOICE=$(wt_menu "Quick Actions" "Select an action:" 20 70 10 "${QA[@]}") || continue
     case "$QA_CHOICE" in
-      "Quick Actions:HEALTH_CHECK")
-        run_health_check
-        ;;
-      "Quick Actions:EXPORT_REPORT")
-        export_full_report
-        ;;
-      "Quick Actions:SEARCH_COMMANDS")
-        search_commands
-        ;;
-      "Quick Actions:VIEW_HISTORY")
-        view_history
-        ;;
-      "Quick Actions:VIEW_FAVORITES")
-        view_favorites
-        ;;
+      "Quick Actions:HEALTH_CHECK")    run_health_check ;;
+      "Quick Actions:EXPORT_REPORT")   export_full_report ;;
+      "Quick Actions:SEARCH_COMMANDS") search_commands ;;
+      "Quick Actions:VIEW_HISTORY")    view_history ;;
+      "Quick Actions:VIEW_FAVORITES")  view_favorites ;;
     esac
     continue
   fi
 
   PAGE=0
   while true; do
-    # Build command list for selected category
     COMMANDS=()
-    for key in "${!MENU[@]}"; do
-      [[ "$key" == "$CATEGORY:"* ]] && COMMANDS+=("$key" "${MENU[$key]}")
-    done
+    for key in "${!MENU[@]}"; do [[ "$key" == "$CATEGORY:"* ]] && COMMANDS+=("$key" "${MENU[$key]}"); done
+    # sort command entries by description for stable, predictable order
+    IFS=$'\n' SORTED=($(for ((i=0; i<${#COMMANDS[@]}; i+=2)); do printf '%s\t%s\n' "${COMMANDS[i]}" "${COMMANDS[i+1]}"; done | sort -t$'\t' -k2)); unset IFS
+    COMMANDS=()
+    for line in "${SORTED[@]}"; do COMMANDS+=("${line%%$'\t'*}" "${line#*$'\t'}"); done
 
-    # Calculate pagination
-    PAGE_SIZE=10
-    ITEMS_PER_PAGE=$((PAGE_SIZE * 2))
+    ITEMS_PER_PAGE=20
     START=$((PAGE * ITEMS_PER_PAGE))
     TOTAL_ITEMS=${#COMMANDS[@]}
-    
-    # Extract page items
-    PAGE_OPTIONS=("${COMMANDS[@]:$START:$ITEMS_PER_PAGE}")
-
-    # Add navigation options
     TOTAL_PAGES=$(( (TOTAL_ITEMS + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
+
+    # Page slice + annotate missing tools with ⚠
+    PAGE_OPTIONS=()
+    for ((i=START; i<START+ITEMS_PER_PAGE && i<TOTAL_ITEMS; i+=2)); do
+      k="${COMMANDS[i]}"; d="${COMMANDS[i+1]}"
+      tool_available "${k#*:}" || d="⚠ $d"
+      PAGE_OPTIONS+=("$k" "$d")
+    done
     [[ $((START + ITEMS_PER_PAGE)) -lt $TOTAL_ITEMS ]] && PAGE_OPTIONS+=("NEXT" "Next page →")
     [[ $PAGE -gt 0 ]] && PAGE_OPTIONS+=("PREV" "← Previous page")
     PAGE_OPTIONS+=("BACK" "↩ Return to category menu")
 
-    CHOICE=$(whiptail --title "$CATEGORY Commands (Page $((PAGE+1))/$TOTAL_PAGES)" --menu "Select a command to run:" 25 100 15 "${PAGE_OPTIONS[@]}" 3>&1 1>&2 2>&3)
-    [[ $? -ne 0 ]] && break
-
+    CHOICE=$(wt_menu "$CATEGORY  (page $((PAGE+1))/$TOTAL_PAGES)" "Select a command to run ( ⚠ = tool not installed ):" 25 100 16 "${PAGE_OPTIONS[@]}") || break
     case "$CHOICE" in
-      "NEXT") PAGE=$((PAGE + 1)); continue ;;
-      "PREV") PAGE=$((PAGE - 1)); continue ;;
-      "BACK") break ;;
-      *)
-        execute_command "$CHOICE"
-        ;;
+      NEXT) PAGE=$((PAGE+1)) ;;
+      PREV) PAGE=$((PAGE-1)) ;;
+      BACK) break ;;
+      *)    execute_command "$CHOICE" ;;
     esac
   done
 done
