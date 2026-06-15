@@ -100,9 +100,6 @@ Pull requests welcome.
 
 MIT.
 
-## Credits
-
-By JEGLY.
 
 ---
 
