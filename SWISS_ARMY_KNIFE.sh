@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # ═══════════════════════════════════════════════════════════════════════════
-# COMPREHENSIVE SYSTEM DIAGNOSTIC TOOLKIT - SWISS ARMY KNIFE EDITION
+# JEGLY'S COMPREHENSIVE SYSTEM DIAGNOSTIC TOOLKIT - SWISS ARMY KNIFE EDITION
 # ═══════════════════════════════════════════════════════════════════════════
 # Dependencies: whiptail, bash, coreutils, less
-# Version: 4.0 - Complete Edition
+# Version: 4.2 
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -uo pipefail
 
-VERSION="4.0"
+VERSION="4.1"
 HISTORY_FILE="$HOME/.diagnostic_history"
 FAVORITES_FILE="$HOME/.diagnostic_favorites"
 CMD_TIMEOUT="${SAK_TIMEOUT:-120}"   # seconds; long-running commands are killed
@@ -392,7 +392,7 @@ MENU["Graphics:nvidia-smi"]="NVIDIA GPU info"
 MENU["Power:acpi -V"]="ACPI information"
 MENU["Power:cat /sys/class/power_supply/BAT0/capacity 2>/dev/null || echo 'No battery found'"]="Battery percentage"
 MENU["Power:cat /sys/class/power_supply/BAT0/status 2>/dev/null || echo 'No battery found'"]="Battery status"
-MENU["Power:powertop --html=~/powertop.html && echo 'Report saved to ~/powertop.html'"]="Power consumption report"
+MENU["Power:powertop --html=/tmp/powertop.html && echo 'Report saved to /tmp/powertop.html'"]="Power consumption report"
 
 # 🔌 USB & PERIPHERALS
 MENU["USB:usb-devices"]="USB device details"
@@ -403,6 +403,29 @@ MENU["USB:dmesg | grep -i usb | tail -50"]="Recent USB messages (last 50)"
 MENU["Bluetooth:bluetoothctl show"]="Bluetooth controller info"
 MENU["Bluetooth:hciconfig -a"]="Bluetooth device info"
 MENU["Bluetooth:rfkill list"]="Radio device status"
+
+# 🤖 ANDROID (ADB)
+MENU["Android ADB:adb devices -l"]="List connected devices (detailed)"
+MENU["Android ADB:adb version"]="ADB version"
+MENU["Android ADB:adb get-state"]="Device connection state"
+MENU["Android ADB:adb shell getprop ro.product.model"]="Device model"
+MENU["Android ADB:adb shell getprop ro.build.version.release"]="Android version"
+MENU["Android ADB:adb shell getprop | head -60"]="Device properties (first 60)"
+MENU["Android ADB:adb shell dumpsys battery"]="Battery status"
+MENU["Android ADB:adb shell df -h"]="Device storage usage"
+MENU["Android ADB:adb shell cat /proc/meminfo | head -20"]="Device memory info (first 20)"
+MENU["Android ADB:adb shell top -b -n 1 | head -30"]="Device process snapshot (first 30)"
+MENU["Android ADB:adb shell uptime"]="Device uptime"
+MENU["Android ADB:adb shell wm size && adb shell wm density"]="Screen size and density"
+MENU["Android ADB:adb shell ip -br addr"]="Device network interfaces"
+MENU["Android ADB:adb shell pm list packages -3 | head -50"]="Third-party packages (first 50)"
+MENU["Android ADB:adb shell pm list packages | wc -l"]="Count installed packages"
+MENU["Android ADB:adb logcat -d -t 100"]="Last 100 logcat lines (dump, no follow)"
+MENU["Android ADB:adb logcat -d -t 200 *:E"]="Recent logcat errors only"
+MENU["Android ADB:adb kill-server && adb start-server"]="Restart ADB server (fixes stuck devices)"
+COMMAND_SAFETY["Android ADB:adb kill-server && adb start-server"]="MODIFIES"
+MENU["Android ADB:adb reboot"]="⚠️  Reboot the connected device"
+COMMAND_SAFETY["Android ADB:adb reboot"]="DANGEROUS"
 
 # 📋 SYSTEM INFO SUMMARY
 MENU["System Info:screenfetch"]="System info with ASCII art"
@@ -430,8 +453,17 @@ wt_yesno() { whiptail --title "$1" --yesno "$2" "${3:-14}" "${4:-78}" 3>&1 1>&2 
 wt_input() { whiptail --title "$1" --inputbox "$2" "${3:-10}" "${4:-72}" "${5:-}" 3>&1 1>&2 2>&3; }
 wt_msg()   { whiptail --title "$1" --scrolltext --msgbox "$2" "${3:-22}" "${4:-90}"; }
 
-# First token of a command (ignoring a leading sudo).
-base_cmd() { awk '{print $1}' <<<"${1#sudo }"; }
+# First token of a command. A leading `sudo` is skipped, unless sudo itself
+# is the command (e.g. `sudo -l`).
+base_cmd() {
+  local c="$1"
+  if [[ "$c" == sudo\ * ]]; then
+    local rest="${c#sudo }"
+    [[ "$rest" == -* ]] && { echo sudo; return; }
+    c="$rest"
+  fi
+  awk '{print $1}' <<<"$c"
+}
 
 # Is the command's primary tool installed?
 tool_available() { command -v "$(base_cmd "$1")" &>/dev/null; }
@@ -446,15 +478,20 @@ check_command_exists() {
   return 0
 }
 
-# Heuristic: does this command likely require root? (FIXES the old dead needs_sudo)
+# Heuristic: does this command likely require root?
+# (Commands with an explicit leading `sudo` are handled in execute_command.)
 command_needs_sudo() {
   local cmd="$1"
   [[ $EUID -eq 0 ]] && return 1            # already root
-  [[ "$cmd" == sudo\ * ]] && return 1      # already explicit
   case "$cmd" in
     iptables*|dmidecode*|hwinfo*|smartctl*|hdparm*|fsck*|tcpdump*|iotop*|\
+    iftop*|fdisk*|parted*|lastb*|slabtop*|efibootmgr*|hwclock*|ufw*|\
+    aa-status*|certbot*|update-ca-certificates*|\
     fail2ban-client*|auditctl*|ausearch*|aureport*|debsums*|powertop*|\
-    *dpkg\ --verify*|*"crontab -l"*) return 0 ;;
+    "apt autoremove"|"apt clean"|*"journalctl --rotate"*|*--vacuum-*|\
+    *"systemd-tmpfiles --clean"*|*dpkg\ --verify*) return 0 ;;
+    # dmesg is root-only when kernel.dmesg_restrict=1 (Ubuntu default)
+    dmesg*) [[ "$(cat /proc/sys/kernel/dmesg_restrict 2>/dev/null)" == 1 ]] && return 0 ;;
   esac
   # Reads a typically root-only log/path (but plain `ls` of it is fine)
   [[ "$cmd" == *"/var/log/auth.log"* || "$cmd" == *"/var/log/kern.log"* ]] \
@@ -567,7 +604,16 @@ execute_command() {
   check_command_exists "$cmd" || return
   safety=$(classify_safety "$key" "$cmd")
 
-  local use_sudo=0; command_needs_sudo "$cmd" && use_sudo=1
+  local use_sudo=0
+  if [[ "$cmd" == sudo\ * ]]; then
+    use_sudo=1
+    local rest="${cmd#sudo }"
+    # Strip the explicit sudo so it isn't doubled below — but keep it when
+    # sudo itself is the command being run (e.g. `sudo -l`).
+    [[ "$rest" == -* ]] || cmd="$rest"
+  elif command_needs_sudo "$cmd"; then
+    use_sudo=1
+  fi
   local sudo_txt="no"; (( use_sudo )) && sudo_txt="yes (sudo)"
   local preview="Command : $cmd\nCategory: ${key%%:*}\nSafety  : $safety\nPrivilege: $sudo_txt\nTimeout : ${CMD_TIMEOUT}s"
 
@@ -584,11 +630,11 @@ execute_command() {
   fi
 
   clear
-  local runner="bash -c" pfx=""
-  (( use_sudo )) && { runner="sudo bash -c"; pfx="sudo "; }
-  echo "▶ ${pfx}$cmd"
+  local runner=(bash -c) pfx=""
+  if (( use_sudo )) && [[ "$cmd" != sudo* ]]; then runner=(sudo bash -c); pfx="sudo "; fi
+  echo "▶ ${pfx}$cmd   (running, timeout ${CMD_TIMEOUT}s)…"
   local output exit_code
-  output=$(timeout "$CMD_TIMEOUT" $runner "$cmd" 2>&1); exit_code=$?
+  output=$(timeout -k 5 "$CMD_TIMEOUT" "${runner[@]}" "$cmd" 2>&1); exit_code=$?
   (( exit_code == 124 )) && output+=$'\n\n[!] Timed out after '"${CMD_TIMEOUT}"'s and was terminated.'
 
   log_to_history "${pfx}$cmd"
@@ -617,50 +663,90 @@ view_history() {
   wt_msg "Command History (last 60)" "$(tail -60 "$HISTORY_FILE")" 28 100
 }
 
+load_favorites() {  # fills the global FAV array with key/description pairs
+  FAV=(); local key
+  while IFS= read -r key; do
+    [[ -n "$key" ]] && FAV+=("$key" "${MENU[$key]:-(no longer available)}")
+  done < "$FAVORITES_FILE"
+}
+
+remove_favorite() {
+  load_favorites
+  (( ${#FAV[@]} )) || return
+  local choice; choice=$(wt_menu "Remove Favorite" "Select a favorite to remove:" 25 100 15 "${FAV[@]}") || return
+  grep -vxF "$choice" "$FAVORITES_FILE" > "$FAVORITES_FILE.tmp" && mv "$FAVORITES_FILE.tmp" "$FAVORITES_FILE"
+  wt_msg "Removed" "Removed from favorites:\n$choice" 9 80
+}
+
 view_favorites() {
   [[ -s "$FAVORITES_FILE" ]] || { wt_msg "No Favorites" "No favorites yet.\n\nAdd one from the post-run menu (⭐ Add to favorites)." 10 60; return; }
-  local fav=() key
-  while IFS= read -r key; do
-    [[ -n "$key" ]] && fav+=("$key" "${MENU[$key]:-(no longer available)}")
-  done < "$FAVORITES_FILE"
-  (( ${#fav[@]} == 0 )) && { wt_msg "No Favorites" "No favorite commands found." 8 50; return; }
-  local choice; choice=$(wt_menu "Favorite Commands" "Select a favorite:" 25 100 15 "${fav[@]}") || return
+  load_favorites
+  (( ${#FAV[@]} == 0 )) && { wt_msg "No Favorites" "No favorite commands found." 8 50; return; }
+  local choice; choice=$(wt_menu "Favorite Commands" "Select a favorite:" 25 100 15 "${FAV[@]}" REMOVE "🗑 Remove a favorite…") || return
+  [[ "$choice" == REMOVE ]] && { remove_favorite; return; }
   execute_command "$choice"
 }
 
 # ─── Reports ──────────────────────────────────────────────────────────────────
-run_health_check() {
-  local report=""
-  report+="═══════════════════════════════════════════════════════════\n"
-  report+="SYSTEM HEALTH CHECK REPORT\nGenerated: $(date)\n"
-  report+="═══════════════════════════════════════════════════════════\n\n"
-  report+="[SYSTEM]\nHostname: $(hostname)\nKernel: $(uname -r)\nUptime: $(uptime -p)\n\n"
-  report+="[LOAD AVERAGE]\n$(uptime | awk -F'load average:' '{print $2}')\n\n"
-  report+="[CPU]\n$(lscpu | grep -E '^Model name|^CPU\(s\):|^Thread|^Core')\n\n"
-  report+="[MEMORY]\n$(free -h)\n\n"
-  report+="[DISK]\n$(df -h | grep -vE 'tmpfs|loop')\n\n"
-  report+="[THERMAL]\n"
+build_health_report() {  # plain text on stdout; no UI so it also works for --health
+  echo "═══════════════════════════════════════════════════════════"
+  echo "SYSTEM HEALTH CHECK REPORT"
+  echo "Generated: $(date)"
+  echo "═══════════════════════════════════════════════════════════"
+  echo
+  echo "[SYSTEM]"
+  echo "Hostname: $(hostname)"
+  echo "Kernel: $(uname -r)"
+  echo "Uptime: $(uptime -p)"
+  echo
+  echo "[LOAD AVERAGE]"
+  uptime | awk -F'load average:' '{print $2}'
+  echo
+  echo "[CPU]"
+  lscpu | grep -E '^Model name|^CPU\(s\):|^Thread|^Core'
+  echo
+  echo "[MEMORY]"
+  free -h
+  echo
+  echo "[DISK]"
+  df -h | grep -vE 'tmpfs|loop'
+  echo
+  echo "[THERMAL]"
   local t; t=$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | awk '{printf "%.0f°C ", $1/1000}')
-  report+="${t:-n/a}\n\n"
-  report+="[FAILED SERVICES]\n"
+  echo "${t:-n/a}"
+  echo
+  echo "[FAILED SERVICES]"
   local failed; failed=$(systemctl --failed --no-pager --no-legend 2>/dev/null)
-  report+="${failed:-✓ none}\n\n"
-  report+="[RECENT ERRORS - last 20]\n$(journalctl -p err -n 20 --no-pager 2>/dev/null || echo 'journal unavailable')\n\n"
-  report+="[NETWORK]\n$(ip -br a 2>/dev/null)\n\n"
-  report+="[TOP 5 CPU]\n$(ps aux --sort=-pcpu | head -6 | tail -5)\n\n"
-  report+="[TOP 5 MEM]\n$(ps aux --sort=-%mem | head -6 | tail -5)\n\n"
-  report+="═══════════════════════════════════════════════════════════\n"
-  display_output "Health Check" "$(echo -e "$report")" 0
+  echo "${failed:-✓ none}"
+  echo
+  echo "[RECENT ERRORS - last 20]"
+  journalctl -p err -n 20 --no-pager 2>/dev/null || echo 'journal unavailable'
+  echo
+  echo "[NETWORK]"
+  ip -br a 2>/dev/null
+  echo
+  echo "[TOP 5 CPU]"
+  ps aux --sort=-pcpu | head -6 | tail -5
+  echo
+  echo "[TOP 5 MEM]"
+  ps aux --sort=-%mem | head -6 | tail -5
+  echo "═══════════════════════════════════════════════════════════"
+}
+
+run_health_check() {
+  local report; report=$(build_health_report)
+  display_output "Health Check" "$report" 0
   if wt_yesno "Save Report?" "Save this health check to a file?" 8 60; then
     local f="$HOME/health_check_$(date +%Y%m%d_%H%M%S).txt"
-    echo -e "$report" > "$f"
+    printf '%s\n' "$report" > "$f"
     wt_msg "Saved" "Report saved to:\n$f" 9 70
   fi
 }
 
 export_full_report() {
+  local cli="${1:-}"
   local f="$HOME/diagnostic_report_$(date +%Y%m%d_%H%M%S).txt"
-  whiptail --title "Generating Report" --infobox "Collecting diagnostics…\nThis can take a minute." 8 60
+  [[ "$cli" == --cli ]] || whiptail --title "Generating Report" --infobox "Collecting diagnostics…\nThis can take a minute." 8 60
   {
     echo "════════════════════════════════════════════════════════════"
     echo "COMPREHENSIVE SYSTEM DIAGNOSTIC REPORT"
@@ -675,7 +761,11 @@ export_full_report() {
     done
     echo; echo "END OF REPORT"
   } > "$f"
-  wt_msg "Report Generated" "Saved to:\n$f\n\nView with:\n  less $f" 12 72
+  if [[ "$cli" == --cli ]]; then
+    echo "Report saved to: $f"
+  else
+    wt_msg "Report Generated" "Saved to:\n$f\n\nView with:\n  less $f" 12 72
+  fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -686,35 +776,32 @@ case "${1:-}" in
   --help|-h)
     echo "Usage: $0 [--health|--report|--version|--help]"
     echo "  (no args)   launch the interactive menu"
-    echo "  --health    run the health check"
-    echo "  --report    export a full diagnostic report"
+    echo "  --health    print the health check to stdout"
+    echo "  --report    export a full diagnostic report to ~/"
     echo "Env: SAK_TIMEOUT=<seconds> per-command timeout (default 120)"
     exit 0 ;;
+  --health) build_health_report; exit 0 ;;
+  --report) export_full_report --cli; exit 0 ;;
+  -*) echo "Unknown option: $1 (see --help)" >&2; exit 1 ;;
 esac
 
 command -v whiptail &>/dev/null || { echo "ERROR: 'whiptail' is required. Install: sudo apt install whiptail"; exit 1; }
 touch "$HISTORY_FILE" "$FAVORITES_FILE" 2>/dev/null || true
 
-case "${1:-}" in
-  --health) run_health_check; exit 0 ;;
-  --report) export_full_report; exit 0 ;;
-esac
+# Keep the history file from growing without bound.
+if [[ -s "$HISTORY_FILE" ]] && (( $(wc -l < "$HISTORY_FILE") > 1000 )); then
+  tail -n 500 "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ═══════════════════════════════════════════════════════════════════════════
+# The menu is static, so the sorted category list only needs building once.
+mapfile -t CATEGORIES < <(printf '%s\n' "${!MENU[@]}" | sed 's/:.*//' | sort -u)
+CATEGORY_OPTIONS=("🔍 SEARCH" "Search all commands by keyword")
+for c in "${CATEGORIES[@]}"; do CATEGORY_OPTIONS+=("$c" "$c"); done
+
 while true; do
-  # Build sorted unique category list
-  CATEGORIES=()
-  for key in "${!MENU[@]}"; do
-    cat="${key%%:*}"
-    [[ " ${CATEGORIES[*]} " == *" $cat "* ]] || CATEGORIES+=("$cat")
-  done
-  IFS=$'\n' CATEGORIES=($(sort <<<"${CATEGORIES[*]}")); unset IFS
-
-  CATEGORY_OPTIONS=("🔍 SEARCH" "Search all commands by keyword")
-  for c in "${CATEGORIES[@]}"; do CATEGORY_OPTIONS+=("$c" "$c"); done
-
   CATEGORY=$(wt_menu "🧰 Swiss Army Knife Diagnostic Toolkit v$VERSION" \
     "Select a category (or search):" 26 74 16 "${CATEGORY_OPTIONS[@]}") || exit 0
 
@@ -734,19 +821,20 @@ while true; do
     continue
   fi
 
+  # Build this category's commands once, sorted by description for a stable order.
+  mapfile -t SORTED < <(for key in "${!MENU[@]}"; do
+      [[ "$key" == "$CATEGORY:"* ]] && printf '%s\t%s\n' "$key" "${MENU[$key]}"
+    done | sort -t$'\t' -k2)
+  COMMANDS=()
+  for line in "${SORTED[@]}"; do COMMANDS+=("${line%%$'\t'*}" "${line#*$'\t'}"); done
+
+  ITEMS_PER_PAGE=20   # array slots (key+description pairs) → 10 visible entries per page
+  TOTAL_ITEMS=${#COMMANDS[@]}
+  TOTAL_PAGES=$(( (TOTAL_ITEMS + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
+
   PAGE=0
   while true; do
-    COMMANDS=()
-    for key in "${!MENU[@]}"; do [[ "$key" == "$CATEGORY:"* ]] && COMMANDS+=("$key" "${MENU[$key]}"); done
-    # sort command entries by description for stable, predictable order
-    IFS=$'\n' SORTED=($(for ((i=0; i<${#COMMANDS[@]}; i+=2)); do printf '%s\t%s\n' "${COMMANDS[i]}" "${COMMANDS[i+1]}"; done | sort -t$'\t' -k2)); unset IFS
-    COMMANDS=()
-    for line in "${SORTED[@]}"; do COMMANDS+=("${line%%$'\t'*}" "${line#*$'\t'}"); done
-
-    ITEMS_PER_PAGE=20
     START=$((PAGE * ITEMS_PER_PAGE))
-    TOTAL_ITEMS=${#COMMANDS[@]}
-    TOTAL_PAGES=$(( (TOTAL_ITEMS + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
 
     # Page slice + annotate missing tools with ⚠
     PAGE_OPTIONS=()
